@@ -89,7 +89,7 @@ enum Token {
 
   T_IDENTIFIER = '0',
   T_NUMBER = '1',
-  T_FLOAT = '2',
+  T_DOUBLE = '2',
   T_STRING = '3',
   T_MSTRING = '4',
   T_RANGE = '5',
@@ -138,6 +138,7 @@ enum Token {
   T_GREATEQ = 'G',
   T_NOTEQ = 'T',
   T_EQEQ = 'E',
+  T_VARG = 'V',
 };
 
 enum NTYPE {
@@ -146,6 +147,7 @@ enum NTYPE {
   N_STRING,
   N_ARRAY,
   N_OBJECT,
+	N_VARG,
 
   N_VARIABLE,
 
@@ -165,14 +167,15 @@ enum NTYPE {
 
 struct Node {
   NTYPE type;
-  llvm::Type* ty;
-  std::vector<struct Node> nodes;
+  struct Scope* scope;
   union as {
     double dnumber;
     uint64_t inumber;
     //const char* str;
     Token token;
   } as;
+  llvm::Type* ty;
+  std::vector<struct Node> nodes;
 };
 
 void cupErrorf(const char* format...);
@@ -360,17 +363,14 @@ bool readFile(SFile& file, const char* name) {
   return CUPSUCCESS;
 }
 
-
-struct Scope {
+static struct Scope {
   struct ScopeValue {
 		Value* value;
     std::vector<ScopeValue*> links;
   };
   std::unordered_map<const char*, ScopeValue> variables;
   Scope* parent;
-};
-
-static Scope* this_scope = nullptr;
+} *this_scope = nullptr;
 
 static void InitializeModuleAndManagers(void) {
   // Open a new context and module.
@@ -418,6 +418,7 @@ static TOKENNUMTYPE token_num = 0;
 
 static Token CurTok;
 static Node root;
+static Node empty = { N_OPERATOR, nullptr, T_COMMA };
 
 static const char* rstr = "return";
 static const char* tstr = "type";
@@ -430,12 +431,21 @@ static const char* doubletype = "double";
 static const char* arraytype = "array";
 static const char* pointertype = "pointer";
 
+static std::vector<const char*> lld_args = {
+     "lld-link",
+     "/entry:main",
+     "/subsystem:console",
+     nullptr,
+     nullptr,
+};
+
 static char* this_module = nullptr;
 Value* codegen(Node node, Type* type);
 
 Value* findvar(const char* name, Scope* scope) {
-  if (scope == nullptr)
+  if (scope == nullptr) {
     return nullptr;
+  }
   auto it = scope->variables.find(name);
   if (it != scope->variables.end())
     return it->second.value;
@@ -452,7 +462,7 @@ Type* getNodeType(Node node) {
     // With opaque pointers, we return a pointer to i8
     return PointerType::get(Type::getInt8Ty(*TheContext), 0);
   case N_VARIABLE: {
-    Value* V = findvar(global_strings[node.as.inumber], this_scope);
+    Value* V = findvar(global_strings[node.as.inumber], node.scope);
     if (V == nullptr)
       return Type::getInt64Ty(*TheContext);
 
@@ -503,7 +513,7 @@ Value* codegenassign(Node node, Token token) {
     if (front.type != N_VARIABLE)
       cupErrorf("codegenassign: unhandled node type %n\n", node);
     const char* name = global_strings[front.as.inumber];
-    auto var = findvar(name, this_scope);
+    auto var = findvar(name, node.scope);
 
 		Value* val = nullptr;
     if (var)
@@ -541,10 +551,10 @@ Value* codegenassign(Node node, Token token) {
               Builder->CreateStore(element, elemPtr);
             }
 
-            this_scope->variables.insert({ name, { Alloca } });
+            node.scope->variables.insert({ name, { Alloca } });
             return val;
           }
-          this_scope->variables.insert({ name, { Alloca } });
+          node.scope->variables.insert({ name, { Alloca } });
           var = Alloca;
         }
         Builder->CreateStore(val, var);
@@ -556,7 +566,7 @@ Value* codegenassign(Node node, Token token) {
         gvar = new GlobalVariable(
           *TheModule, val->getType(), false, GlobalValue::ExternalLinkage,
             Constant::getNullValue(val->getType()), name);
-        this_scope->variables.insert({ name , { gvar } });
+        node.scope->variables.insert({ name , { gvar } });
       }
       if (!isa<Constant>(val))
         cupError("Global initializer must be constant");
@@ -624,10 +634,6 @@ Function* codegenfunction(Node node) {
     }
   }
 
-  Scope* oldScope = this_scope;
-  this_scope = new Scope();
-  this_scope->parent = oldScope;
-
   // Create function argument types
   std::vector<const char*> argNames;
 
@@ -694,9 +700,31 @@ Function* codegenfunction(Node node) {
 
   function->print(errs());
 
-  this_scope = oldScope;
-
   return function;
+}
+
+void codegenargs(Node argsNode, std::vector<Value*>& args, size_t& varargs) {
+  switch (argsNode.type) {
+  case N_OPERATOR:
+    if (argsNode.as.token == T_COMMA) {
+			for (auto& arg : argsNode.nodes) {
+				codegenargs(arg, args, varargs);
+			}
+			return;
+    }
+    cupError("Invalid function argument list 2");
+	case N_VARG:
+		varargs = args.size();
+    break;
+  case N_STRING:
+  case N_NUMBER:
+  case N_VARIABLE:
+		args.push_back(codegen(argsNode, nullptr));
+		break;
+  default:
+    cupErrorf("Invalid '%n'\n", argsNode);
+    break;
+  }
 }
 
 #define codegenop(left, right, a, b, c) \
@@ -872,9 +900,11 @@ Value* codegen(Node node, Type* type) {
     return nullptr;
   case N_VARIABLE: {
     const char* name = global_strings[node.as.inumber];
-    Value* V = findvar(name, this_scope);
-    if (V == nullptr)
-      cupErrorf("Unknown variable \"%s\"", name);
+    Value* V = findvar(name, node.scope);
+    if (V == nullptr) {
+      cupErrorf("Unknown variable '%s'\n", name);
+			return nullptr;
+    }
 
     if (auto A = dyn_cast<AllocaInst>(V)) {
       Type* allocTy = A->getAllocatedType();
@@ -984,53 +1014,47 @@ Value* codegen(Node node, Type* type) {
 			cupError("Invalid function call");
     }
     const char* name = global_strings[node.nodes.front().as.inumber];
-    Value* V = findvar(name, this_scope);
+    Value* V = findvar(name, node.scope);
     if (V != nullptr) {
 			cupErrorf("Function name conflicts with variable name");
     }
 
     Node argsNode = node.nodes.back();
     std::vector<Value*> args;
+    size_t varargs = -1;
 
-    if (argsNode.type == N_OPERATOR && argsNode.as.token == T_COMMA) {
-      for (auto& arg : argsNode.nodes) {
-        Value* argVal = codegen(arg, nullptr);
-        if (!argVal)
-          return nullptr;
-        args.push_back(argVal);
-      }
-    }
-    else {
-      Value* argVal = codegen(argsNode, nullptr);
-      if (!argVal)
-        return nullptr;
-      args.push_back(argVal);
-    }
+    codegenargs(argsNode, args, varargs);
 
     Function* F = TheModule->getFunction(name);
     if (!F) {
       // Infer function type from arguments
       std::vector<Type*> paramTypes;
-      for (Value* arg : args) {
-        paramTypes.push_back(arg->getType());
+      for (size_t i = 0; i < args.size(); i++) {
+        if (i == varargs)
+					break;
+        paramTypes.push_back(args[i]->getType());
       }
 			FunctionType* FT = nullptr;
       if (type)
       {
-        FT = FunctionType::get(type, paramTypes, false);
+        FT = FunctionType::get(type, paramTypes, varargs != -1);
 			}
 			else
 			{
-				FT = FunctionType::get(Type::getInt64Ty(*TheContext), paramTypes, false);
+				FT = FunctionType::get(Type::getInt64Ty(*TheContext), paramTypes, varargs != -1);
 			}
       F = Function::Create(FT, Function::ExternalLinkage, name, TheModule.get());
     }
 
-    if (F->arg_size() != args.size())
+    if (F->arg_size() != args.size() && varargs == -1)
       cupErrorf("Incorrect number of arguments passed: expected %z, got %z",
         F->arg_size(), args.size());
 
-    for (unsigned i = 0; i < args.size(); i++) {
+    if (isGlobal)
+    {
+      cupError("Cannot call function from global scope");
+    }
+    for (unsigned i = 0; i < F->arg_size(); i++) {
       Value* arg = args[i];
       Type* expectedType = F->getFunctionType()->getParamType(i);
       // Далее каст (если типы разные)
@@ -1055,17 +1079,12 @@ Value* codegen(Node node, Type* type) {
     return Builder->CreateCall(F, args, "calltmp");
   }
   case N_BLOCK: {
-    Scope* oldScope = this_scope;
-    this_scope = new Scope();
-    this_scope->parent = oldScope;
-
     Value* lastVal = nullptr;
     for (auto it : node.nodes) {
       lastVal = codegen(it, nullptr);
       if (!lastVal)
         return nullptr;
     }
-    this_scope = oldScope;
     return lastVal;
   }
   case N_FUNCTION: {
@@ -1099,6 +1118,7 @@ Value* codegenModule(Node& node) {
 			GlobalValue::PrivateLinkage, Val, Name
 		);
   }
+	Value* val = nullptr;
 
   for (Node& it : node.nodes) {
     if (it.type == N_CONTROLFLOW && it.as.token == T_RETURN) {
@@ -1106,25 +1126,45 @@ Value* codegenModule(Node& node) {
       cupError("return not implemented yet");
       return nullptr;
     }
-    Value* val = codegen(it, nullptr);
-    if (!val)
-      return nullptr;
+    val = codegen(it, nullptr);
+    if (!val) return nullptr;
   }
+
+	return val;
 }
 
 std::ostream& operator<<(std::ostream& os, const Token t) {
   switch (t) {
-  case T_EOF:
-    return os << "eof";
-  case T_NL:
-    return os << "nl";
+  case T_EOF: return os << "eof";
+  case T_NL: return os << "nl";
+  case T_IDENTIFIER: return os << "identifier";
+	case T_NUMBER: return os << "number";
+	case T_DOUBLE: return os << "double";
+	case T_STRING: return os << "string";
+  case T_MSTRING: return os << "mstring";
+  case T_RANGE: return os << "range";
+	case T_ADDEQ: return os << "+=";
+	case T_SUBEQ: return os << "-=";
+	case T_MULEQ: return os << "*=";
+	case T_DIVEQ: return os << "/=";
+	case T_MODEQ: return os << "%=";
+	case T_ANDEQ: return os << "&=";
+	case T_OREQ: return os << "|=";
+	case T_XOREQ: return os << "^=";
+  case T_LESSEQ: return os << "<=";
+  case T_GREATEQ: return os << ">=";
+  case T_NOTEQ: return os << "!=";
+  case T_EQEQ: return os << "==";
   default:
     return os << (char)t;
   }
 }
 std::ostream& operator<<(std::ostream& os, const Node n) {
+  if (n.scope == nullptr) {
+    os << " ### ";
+  }
   switch (n.type) {
-  default:          return os;
+  default:          return os << "{ " << n.type << " }";
   case N_OBJECT:
     cupError("object not implemented yet");
   case N_NUMBER:    return os << "{ number " << n.as.inumber << " }";
@@ -1244,18 +1284,7 @@ void cupErrorf(const char* format...) {
       continue;
     }
     if (c == 't') {
-      Token t = va_arg(args, Token);
-      switch (t) {
-      case T_EOF:
-        fwrite("eof", 3, 1, stderr);
-        break;
-      case T_NL:
-        fwrite("nl", 2, 1, stderr);
-        break;
-      default:
-        putc(t, stderr);
-        break;
-      }
+			std::cerr << va_arg(args, Token) << std::flush;
       continue;
     }
     if (c == 'v') {
@@ -1425,13 +1454,22 @@ Token getToken(bool newlines) {
       return types1[token_num];
     file.ptr++;
     return doubles[token_num];
+  case '.': {
+    if (*(++file.ptr) == '.') {
+      if (file.ptr[1] == '.') {
+        file.ptr++; file.ptr++;
+        return T_VARG;
+      }
+      return T_DOT;
+    }
+    return T_DOT;
+  }
   case '(':
   case ')':
   case '{':
   case '}':
   case '[':
   case ']':
-  case '.':
   case ',':
   case ':':
   case ';':
@@ -1487,15 +1525,14 @@ Token getNextToken(bool newlines) {
 
 const Node parse() {
   getNextToken(true);
+  root.scope = this_scope;
 
   while (CurTok != T_EOF) {
     root.nodes.push_back(statement());
   }
-  puts("end parse\n");
 
-  std::cout << root << "\n" << std::endl;
+  std::cout << root << std::endl;
 
-  puts("end typedef\n");
   return root;
 }
 
@@ -1568,6 +1605,7 @@ void expectandnext(Token t) {
 const Node primary(uint8_t mpower) {
   // TODO: unary T_ADD T_SUB T_NOT
   Node left = {};
+	left.scope = this_scope;
   switch (CurTok) {
   case T_ORB: {
     getNextToken(true);
@@ -1576,21 +1614,19 @@ const Node primary(uint8_t mpower) {
     break;
   }
   case T_IDENTIFIER: {
-    left = { N_VARIABLE };
+    left.type = N_VARIABLE;
     left.as.inumber = token_num;
     getNextToken(false);
     if (CurTok == T_ORB) {
-      Node node = { N_CALL };
-      node.nodes.push_back(left);
+      Node temp = { N_CALL, this_scope };
+      temp.nodes.push_back(left);
+      left = temp;
 			if (getNextToken(true) == T_CRB) {
-				Node empty = { N_OPERATOR };
-				empty.as.token = T_COMMA;
-				node.nodes.push_back(empty);
+        left.nodes.push_back(empty);
 			}
 			else {
-				node.nodes.push_back(primary());
+        left.nodes.push_back(primary());
 			}
-      left = node;
       expectandnext(T_CRB);
     }
     else if (CurTok == T_OSB) {
@@ -1604,13 +1640,13 @@ const Node primary(uint8_t mpower) {
     break;
   }
   case T_STRING: {
-    left = { N_STRING };
+    left.type = N_STRING;
     left.as.inumber = token_num;
     getNextToken(false);
     break;
   }
   case T_NUMBER: {
-    left = { N_NUMBER };
+    left.type = N_NUMBER;
     left.as.inumber = token_num;
 
     if (getNextToken(false) != T_DOT)
@@ -1661,9 +1697,13 @@ const Node primary(uint8_t mpower) {
 		break;
   }
   case T_THIS:
-  case T_DOT:
     cupErrorf("not implemented yet '%t'\n", CurTok);
-    break;
+		break;
+  case T_VARG: {
+    getNextToken(false);
+		left.type = N_VARG;
+		break;
+  }
   default:
     cupErrorf("Unexpected token '%t'\n", CurTok);
     break;
@@ -1682,7 +1722,7 @@ const Node primary(uint8_t mpower) {
       left.nodes.push_back(right);
     }
     else {
-      Node node = { N_OPERATOR };
+      Node node = { N_OPERATOR, this_scope };
       node.as.token = t;
 
       node.nodes.push_back(left); // copy
@@ -1733,6 +1773,7 @@ void argsparse(Node& nodes) {
 
 const Node statement() { // statement
   Node node = {};
+  node.scope = this_scope;
 
   switch (CurTok) {
   case T_IMPORT:
@@ -1741,6 +1782,7 @@ const Node statement() { // statement
     if (getNextToken(false) != T_STRING) {
       cupError("Expected DLL name after '~'");
     }
+		lld_args.push_back(global_strings[token_num]);
     //const char* dllName = token_string;
     //std::string errMsg;
     // Load the DLL permanently
@@ -1777,14 +1819,22 @@ const Node statement() { // statement
       cupError("Expected function name in prototype");
     node.type = N_FUNCTION;
 
-    Node proto = { N_CALL };
-    Node protocall = { N_VARIABLE };
+    Node proto = { N_CALL, this_scope };
+
+    Node protocall = { N_VARIABLE, this_scope };
     protocall.as.inumber = token_num;
+
     expectandnext(T_IDENTIFIER);
     proto.nodes.push_back(protocall);
-    Node nodeargs = { N_COMMA };
+    
+		Scope* oldScope = this_scope;
+		this_scope = new Scope();
+		this_scope->parent = oldScope;
+
+    Node nodeargs = { N_COMMA, this_scope };
     argsparse(nodeargs);
     proto.nodes.push_back(nodeargs);
+
     node.nodes.push_back(proto);
 
     if (CurTok == T_NL)
@@ -1795,10 +1845,16 @@ const Node statement() { // statement
   }
   case T_OCB: { // block
     getNextToken(true); // skip T_OCB {
+    Scope* oldScope = this_scope;
+    this_scope = new Scope();
+    this_scope->parent = oldScope;
+
     node.type = N_BLOCK;
     while (CurTok != T_CCB) {
       node.nodes.push_back(statement());
     }
+
+    this_scope = oldScope;
 
     getNextToken(true); // skip T_CCB }
 
@@ -1848,6 +1904,16 @@ int main(int argc, const char** argv) {
     bool x32;
     bool debug;
   } options = { 0 };
+  
+  //"kernel32.lib",
+      //"user32.lib",
+      //"/libpath:C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.42.34433\\lib\\x64",
+      //"legacy_stdio_definitions.lib",
+      //"msvcrt.lib",
+      //"/libpath:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\ucrt\\x64",
+      //Debug Build : Use ucrtbased.lib
+      //Release Build : Use ucrt.lib
+      //"ucrt.lib"
 
   for (size_t i = 1; i < argc; i++) {
     const char* arg = argv[i];
@@ -1868,6 +1934,13 @@ int main(int argc, const char** argv) {
       case 'd':
       case 'D':
         options.debug = true;
+        continue;
+      case 'l':
+      case 'L':
+        if (i + 1 < argc)
+					lld_args.push_back(argv[++i]);
+				else
+					cupError("Missing argument for -l option");
         continue;
       case 'H':
       case 'h':
@@ -1943,22 +2016,13 @@ int main(int argc, const char** argv) {
 		printf("Object file emitted to %s\n", obj_filename.c_str());
     
 		std::string exe_filename = "/out:" + std::string(file.name) + ".exe";
-    std::vector<const char*> lld_args = {
-      "lld-link",
-      "/entry:main",
-      "/subsystem:console",
-      obj_filename.c_str(),
-      exe_filename.c_str(),
-       "kernel32.lib",
-			 "user32.lib",
-       "/libpath:C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.42.34433\\lib\\x64",
-       "legacy_stdio_definitions.lib",
-       //"msvcrt.lib",
-       "/libpath:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\ucrt\\x64",
-       //Debug Build : Use ucrtbased.lib
-       //Release Build : Use ucrt.lib
-       "ucrt.lib"
-      };
+		lld_args[3] = obj_filename.c_str();
+		lld_args[4] = exe_filename.c_str();
+    printf("lld64 args: ");
+    for (size_t i = 0; i < lld_args.size(); i++) {
+			printf("%s ", lld_args[i]);
+    }
+		printf("\n");
     auto r = lld::lldMain(lld_args, llvm::outs(), llvm::errs(), LLD_ALL_DRIVERS);
     //printf("lld64 canRunAgain: %d\n", r.canRunAgain);
     if (r.retCode != 0) {
