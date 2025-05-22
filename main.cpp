@@ -2018,11 +2018,6 @@ int main(int argc, const char** argv) {
 		std::string exe_filename = "/out:" + std::string(file.name) + ".exe";
 		lld_args[3] = obj_filename.c_str();
 		lld_args[4] = exe_filename.c_str();
-    printf("lld64 args: ");
-    for (size_t i = 0; i < lld_args.size(); i++) {
-			printf("%s ", lld_args[i]);
-    }
-		printf("\n");
     auto r = lld::lldMain(lld_args, llvm::outs(), llvm::errs(), LLD_ALL_DRIVERS);
     //printf("lld64 canRunAgain: %d\n", r.canRunAgain);
     if (r.retCode != 0) {
