@@ -1,4 +1,4 @@
-#include <array>
+﻿#include <array>
 #include <unordered_map>
 #include <unordered_set>
 #include <iostream>
@@ -142,12 +142,15 @@ enum Token {
 };
 
 enum NTYPE {
+  N_COMMA,
   N_NUMBER,
   N_DOUBLE,
   N_STRING,
   N_ARRAY,
   N_OBJECT,
-	N_VARG,
+  N_VARG,
+
+  N_NOT,
 
   N_VARIABLE,
 
@@ -155,34 +158,53 @@ enum NTYPE {
   N_SUBSCRIPT,
   N_MEMBER,
 
-  N_OPERATOR,
-  N_COMMA,
+  N_EQEQ,
+  N_ASSIGN,
+  N_ADD,
+  N_ADDASSIGN,
+  N_SUB,
+  N_SUBASSIGN,
+  N_MUL,
+  N_MULASSIGN,
+  N_DIV,
+  N_DIVASSIGN,
+  N_MOD,
+  N_MODASSIGN,
+  N_AND,
+  N_ANDASSIGN,
+  N_OR,
+  N_ORASSIGN,
+  N_XOR,
+  N_XORASSIGN,
+  N_LESSEQUALASSIGN,
+  N_GREATEQUALASSIGN,
+  N_NOTEQUALASSIGN,
+  N_EQUALEQUALASSIGN,
+  N_LEFTSHIFTASSIGN,
 
   N_BLOCK,
   N_IF,
+  N_IFELSE,
   N_FOR,
   N_FUNCTION,
-  N_CONTROLFLOW
+
+  N_RETURN,
+  N_CONTINUE,
+  N_BREAK,
+  N_WHILE,
+
 };
 
 struct Node {
   NTYPE type;
-  struct Scope* scope;
-  union as {
-    double dnumber;
-    uint64_t inumber;
-    //const char* str;
-    Token token;
-  } as;
-  llvm::Type* ty;
-  std::vector<struct Node> nodes;
+  uint64_t info;
 };
 
 void cupErrorf(const char* format...);
 static void cupError(const char* err) { cupErrorf("%s\n", err); }
 
-const Node statement();
-const Node primary(uint8_t mpower = 1);
+const std::list<Node> statement();
+const std::list<Node> primary(uint8_t mpower = 1);
 
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
@@ -199,8 +221,8 @@ static ExitOnError ExitOnErr;
 class CUPJIT {
 private:
   std::unique_ptr<orc::ExecutionSession> ES;
-  
-	DataLayout DL;
+
+  DataLayout DL;
 
   orc::RTDyldObjectLinkingLayer ObjectLayer;
   orc::IRCompileLayer CompileLayer;
@@ -251,9 +273,9 @@ public:
   }
   const DataLayout& getDataLayout() const { return DL; }
   const Triple& getTargetTriple() const { return ES->getExecutorProcessControl().getTargetTriple(); }
-	Expected<std::unique_ptr<MemoryBuffer>> getMemoryBufferForFile() {
-		return CompileLayer.getCompiler().operator()(*TheModule);
-	}
+  Expected<std::unique_ptr<MemoryBuffer>> getMemoryBufferForFile() {
+    return CompileLayer.getCompiler().operator()(*TheModule);
+  }
   orc::JITDylib& getMainJITDylib() { return MainJD; }
 
   Error addModule(orc::ThreadSafeModule TSM,
@@ -264,7 +286,7 @@ public:
   }
 
   Expected<orc::ExecutorSymbolDef> lookup(StringRef Name) {
-		orc::MangleAndInterner Mangle(*this->ES, DL);
+    orc::MangleAndInterner Mangle(*this->ES, DL);
     return ES->lookup({ &MainJD }, Mangle(Name.str()));
   }
 };
@@ -364,11 +386,7 @@ bool readFile(SFile& file, const char* name) {
 }
 
 static struct Scope {
-  struct ScopeValue {
-		Value* value;
-    std::vector<ScopeValue*> links;
-  };
-  std::unordered_map<const char*, ScopeValue> variables;
+  std::unordered_map<const char*, Value*> variables;
   Scope* parent;
 } *this_scope = nullptr;
 
@@ -412,13 +430,14 @@ static void InitializeModuleAndManagers(void) {
 
 static SFile file = { 0 };
 
-static std::vector<const char*> global_strings = {};
-
 static TOKENNUMTYPE token_num = 0;
 
 static Token CurTok;
 static Node root;
-static Node empty = { N_OPERATOR, nullptr, T_COMMA };
+
+static std::vector<const char*> global_strings = {};
+
+static std::list<Node> global_nodes = {};
 
 static const char* rstr = "return";
 static const char* tstr = "type";
@@ -440,7 +459,21 @@ static std::vector<const char*> lld_args = {
 };
 
 static char* this_module = nullptr;
-Value* codegen(Node node, Type* type);
+
+Value* codegen(Node node);
+
+AllocaInst* CreateEntryBlockAlloca(Function* TheFunction, Type* type) {
+  BasicBlock& EntryBlock = TheFunction->getEntryBlock();
+  auto InsertPoint = EntryBlock.begin();
+
+  // Find insertion point after existing allocas
+  while (InsertPoint != EntryBlock.end() && isa<AllocaInst>(*InsertPoint)) {
+    ++InsertPoint;
+  }
+
+  IRBuilder TmpB(&EntryBlock, InsertPoint);
+  return TmpB.CreateAlloca(type, nullptr);
+}
 
 Value* findvar(const char* name, Scope* scope) {
   if (scope == nullptr) {
@@ -448,65 +481,10 @@ Value* findvar(const char* name, Scope* scope) {
   }
   auto it = scope->variables.find(name);
   if (it != scope->variables.end())
-    return it->second.value;
+    return it->second;
   return findvar(name, scope->parent);
 }
-
-Type* getNodeType(Node node) {
-  switch (node.type) {
-  case N_NUMBER:
-    return Type::getInt64Ty(*TheContext);
-  case N_DOUBLE:
-    return Type::getDoubleTy(*TheContext);
-  case N_STRING:
-    // With opaque pointers, we return a pointer to i8
-    return PointerType::get(Type::getInt8Ty(*TheContext), 0);
-  case N_VARIABLE: {
-    Value* V = findvar(global_strings[node.as.inumber], node.scope);
-    if (V == nullptr)
-      return Type::getInt64Ty(*TheContext);
-
-    if (auto G = dyn_cast<GlobalVariable>(V))
-      return G->getValueType();
-
-    if (auto A = dyn_cast<AllocaInst>(V))
-      return A->getAllocatedType();
-
-    // For other values, just return their type directly
-    return V->getType();
-  }
-  default:
-    cupErrorf("getNodeType: unhandled node type %n\n", node);
-    return nullptr;
-  }
-}
-
-void typedefargs(Node node, std::vector<Type*>& args) {
-  if (node.type == N_OPERATOR && node.as.token == T_EQ) {
-    typedefargs(node.nodes.back(), args);
-    return;
-  }
-  if (node.type == N_OPERATOR && node.as.token == T_COMMA) {
-    for (auto it : node.nodes) {
-      typedefargs(it, args);
-    }
-    return;
-  }
-  if (node.type == N_NUMBER) {
-    args.push_back(Type::getInt64Ty(*TheContext));
-    return;
-  }
-  if (node.type == N_DOUBLE) {
-    args.push_back(Type::getDoubleTy(*TheContext));
-    return;
-  }
-  if (node.type == N_STRING) {
-    args.push_back(PointerType::get(Type::getInt8Ty(*TheContext), 0));
-    return;
-  }
-  cupErrorf("typedefargs: unhandled node type %n\n", node);
-}
-
+/*
 Value* codegenassign(Node node, Token token) {
   if (token == T_EQ) {
     auto front = node.nodes.front();
@@ -515,90 +493,88 @@ Value* codegenassign(Node node, Token token) {
     const char* name = global_strings[front.as.inumber];
     auto var = findvar(name, node.scope);
 
-		Value* val = nullptr;
+    Value* val = nullptr;
     if (var)
       val = codegen(node.nodes.back(), var->getType());
-		else
-			val = codegen(node.nodes.back(), nullptr);
+    else
+      val = codegen(node.nodes.back(), nullptr);
     if (!val)
       return nullptr;
-    
+
     if (Builder->GetInsertBlock()) {
-        // Локальная переменная
-        if (var == nullptr) {
-          // Иначе создаем новую переменную
+      // Локальная переменная
+      if (var == nullptr) {
+        AllocaInst* Alloca = nullptr;
+        if (auto A = dyn_cast<AllocaInst>(val)) {
+          Alloca = A;
+        }
+        else {
           Function* TheFunction = Builder->GetInsertBlock()->getParent();
-          IRBuilder TmpB(&TheFunction->getEntryBlock(), TheFunction->getEntryBlock().begin());
-          AllocaInst* Alloca = TmpB.CreateAlloca(val->getType(), nullptr, name);
-          // Check if we're assigning an array
-          if (val->getType()->isArrayTy()) {
-            ArrayType* arrayType = cast<ArrayType>(val->getType());
-            // Store each element individually
-            for (unsigned i = 0; i < arrayType->getNumElements(); ++i) {
-              // Extract the element from our array value
-              Value* element = Builder->CreateExtractValue(val, i);
-
-              // Create indices for GEP
-              Value* idxs[] = {
-                ConstantInt::get(Type::getInt64Ty(*TheContext), 0),
-                ConstantInt::get(Type::getInt64Ty(*TheContext), i)
-              };
-
-              // GEP to get pointer to array element
-              Value* elemPtr = Builder->CreateInBoundsGEP(arrayType, Alloca, idxs, "elemPtr");
-
-              // Store element
-              Builder->CreateStore(element, elemPtr);
-            }
-
-            node.scope->variables.insert({ name, { Alloca } });
-            return val;
+          Alloca = CreateEntryBlockAlloca(TheFunction, val->getType());
+        }
+        if (val->getType()->isArrayTy()) {
+          ArrayType* arrayType = cast<ArrayType>(val->getType());
+          for (unsigned i = 0; i < arrayType->getNumElements(); ++i) {
+            Value* element = Builder->CreateExtractValue(val, i);
+            Value* elemPtr = Builder->CreateInBoundsGEP(
+              arrayType->getElementType(), Alloca, ConstantInt::get(Type::getInt64Ty(*TheContext), i));
+            Builder->CreateStore(element, elemPtr);
           }
           node.scope->variables.insert({ name, { Alloca } });
-          var = Alloca;
+          return val;
         }
+        node.scope->variables.insert({ name, { Alloca } });
+        var = Alloca;
+      }
+      if (val != var)
+      {
         Builder->CreateStore(val, var);
-        return val;
       }
-      // Глобальная переменная
-      GlobalVariable* gvar = dyn_cast_or_null<GlobalVariable>(var);
-      if (gvar == nullptr) {
-        gvar = new GlobalVariable(
-          *TheModule, val->getType(), false, GlobalValue::ExternalLinkage,
-            Constant::getNullValue(val->getType()), name);
-        node.scope->variables.insert({ name , { gvar } });
-      }
-      if (!isa<Constant>(val))
-        cupError("Global initializer must be constant");
-      gvar->setInitializer(cast<Constant>(val));
-      return gvar;
+      return val;
     }
+    // Глобальная переменная
+    GlobalVariable* gvar = dyn_cast_or_null<GlobalVariable>(var);
+    if (gvar == nullptr) {
+      gvar = new GlobalVariable(
+        *TheModule, val->getType(), false, GlobalValue::ExternalLinkage,
+        Constant::getNullValue(val->getType()), name);
+      node.scope->variables.insert({ name , { gvar } });
+    }
+    if (!isa<Constant>(val))
+      cupError("Global initializer must be constant");
+    gvar->setInitializer(cast<Constant>(val));
+    return gvar;
+  }
   cupError("codegenassign");
   return nullptr;
 }
-
 Function* codegenfunction(Node node) {
   Node proto = node.nodes.front();
+  Node body = node.nodes.back();
   Node argsNode = proto.nodes.back();
   const char* name = global_strings[proto.nodes.front().as.inumber];
+
+  std::vector<const char*> argNames;
   std::vector<Type*> argTypes;
+
   FunctionType* funcType = nullptr;
   Type* returnType = Type::getInt64Ty(*TheContext);
 
-
   if (auto* F = TheModule->getFunction(name)) {
-		cupError("Function already defined");
+    cupError("Function already defined");
     return F;
   }
-  if (argsNode.type != N_COMMA) {
-    cupError("Invalid function argument list");
-  }
-  for (auto n : argsNode.nodes) {
-    typedefargs(n, argTypes);
+  for (size_t i = 0; i < argsNode.nodes.size(); i++) {
+    auto n = argsNode.nodes[i];
+    if (n.type == N_VARIABLE) {
+      argNames.push_back(global_strings[n.as.inumber]);
+      argTypes.push_back(Type::getInt64Ty(*TheContext));
+      continue;
+    }
+    cupErrorf("typedefargs: unhandled node type %n\n", n);
   }
 
   if (node.nodes.size() == 1) {
-    // Function prototype
     funcType = FunctionType::get(returnType, argTypes, false);
     return Function::Create(funcType, Function::ExternalLinkage, name, TheModule.get());
   }
@@ -634,55 +610,30 @@ Function* codegenfunction(Node node) {
     }
   }
 
-  // Create function argument types
-  std::vector<const char*> argNames;
-
-  // Handle arguments
-  if (argsNode.type == N_COMMA) {
-    for (auto& argNode : argsNode.nodes) {
-      // Default to 64-bit integers for parameters if type not specified
-      argTypes.push_back(Type::getInt64Ty(*TheContext));
-      argNames.push_back(global_strings[argNode.as.inumber]);
-    }
-  }
-
   // Create function type
   funcType = FunctionType::get(returnType, argTypes, false);
 
   // Create function
   Function* function = Function::Create(funcType, Function::ExternalLinkage,
     name, *TheModule);
+  BasicBlock* BB = BasicBlock::Create(*TheContext, "entry", function);
+  Builder->SetInsertPoint(BB);
 
   // Set parameter names
   unsigned idx = 0;
   for (auto& arg : function->args()) {
     if (idx < argNames.size()) {
-      arg.setName(argNames[idx++]);
+      arg.setName(argNames[idx]);
+      AllocaInst* a = Builder->CreateAlloca(arg.getType(), nullptr, arg.getName());
+      Builder->CreateStore(&arg, a);
+      body.scope->variables.insert({ argNames[idx], { a } });
+      idx++;
     }
   }
-
-  // Create a new basic block to start insertion into
-  BasicBlock* BB = BasicBlock::Create(*TheContext, "entry", function);
-  Builder->SetInsertPoint(BB);
-
-  // Register arguments in the symbol table
-  idx = 0;
-  for (auto& arg : function->args()) {
-    // Create an alloca for this variable
-    AllocaInst* a =
-      Builder->CreateAlloca(arg.getType(), nullptr, arg.getName());
-
-    // Store the initial value into the alloca
-    Builder->CreateStore(&arg, a);
-
-    // Add arguments to variable symbol table
-    const char* argName = argNames[idx++];
-    // oldBindings[argName] = NamedValues[argName];
-    // NamedValues[argName] = a;
-  }
+  node.scope->variables.insert({ name, { function } });
 
   // Generate code for function body
-  Value* bodyVal = codegen(node.nodes.back(), nullptr);
+  Value* bodyVal = codegen(body, nullptr);
   if (!bodyVal) {
     function->eraseFromParent();
     return nullptr;
@@ -698,29 +649,80 @@ Function* codegenfunction(Node node) {
   // Validate the generated code, checking for consistency
   verifyFunction(*function);
 
-  function->print(errs());
+  // function->print(errs());
 
   return function;
 }
+Value* codegenobject(Node node) {
+  if (node.nodes.size() == 0)
+    cupError("Empty objects are not supported yet");
+  StructType* MyClassTy = StructType::create(*TheContext);
+  std::vector<Value*> members;
 
-void codegenargs(Node argsNode, std::vector<Value*>& args, size_t& varargs) {
-  switch (argsNode.type) {
-  case N_OPERATOR:
-    if (argsNode.as.token == T_COMMA) {
-			for (auto& arg : argsNode.nodes) {
-				codegenargs(arg, args, varargs);
-			}
-			return;
+  for (size_t i = 0; i < node.nodes.size(); i++) {
+    auto n = node.nodes[i];
+    switch (n.type) {
+    case N_OPERATOR: {
+      if (n.as.token == T_COMMA) {
+        for (size_t j = 0; j < n.nodes.size(); j++) {
+          auto m = n.nodes[j];
+          switch (m.type) {
+          case N_OPERATOR: {
+            if (m.as.token == T_EQ) {
+              auto front = m.nodes.front();
+              if (front.type != N_VARIABLE)
+                cupErrorf("codegenassign: unhandled node type %n\n", front);
+              const char* name = global_strings[front.as.inumber];
+              auto var = findvar(name, m.scope);
+              Value* val = nullptr;
+              if (var)
+                val = codegen(m.nodes.back(), var->getType());
+              else
+                val = codegen(m.nodes.back(), nullptr);
+              if (!val)
+                return nullptr;
+              members.push_back(val);
+            }
+            break;
+          }
+          default:
+            cupErrorf("codegenobject in comma: unknown node type %n\n", m);
+            break;
+          }
+        }
+      }
+      break;
     }
-    cupError("Invalid function argument list 2");
-	case N_VARG:
-		varargs = args.size();
-    break;
+    default:
+      cupErrorf("codegenobject: unknown node type %n\n", n);
+      break;
+    }
+  }
+
+  cupError("Objects are not supported yet");
+  return nullptr;
+}
+*/
+size_t codegenargs(Node argsNode, std::vector<Value*>& args) {
+  switch (argsNode.type) {
+  case N_COMMA: {
+    size_t ret = -1;
+    for (size_t i = 0; i < argsNode.info; i++) {
+      auto arg = global_nodes.front();
+      global_nodes.pop_front();
+      if (codegenargs(arg, args) != -1) {
+        ret = i;
+      }
+    }
+    return ret;
+  }
+  case N_VARG:
+    return args.size();
   case N_STRING:
   case N_NUMBER:
   case N_VARIABLE:
-		args.push_back(codegen(argsNode, nullptr));
-		break;
+    args.push_back(codegen(argsNode));
+    return -1;
   default:
     cupErrorf("Invalid '%n'\n", argsNode);
     break;
@@ -737,66 +739,553 @@ void codegenargs(Node argsNode, std::vector<Value*>& args, size_t& varargs) {
   }\
   return isFloat ? b(L, R) : c(L, R)
 
-Value* codegen(Node node, Type* type) {
+Value* codegen(Node node) {
   static Constant* Zero = ConstantInt::get(Type::getInt64Ty(*TheContext), 0);
+  static std::vector<Constant*> Zeros = { Zero, Zero };
   bool isGlobal = (Builder->GetInsertBlock() == nullptr);
   switch (node.type) {
   case N_NUMBER:
-    return ConstantInt::get(Type::getInt64Ty(*TheContext), node.as.inumber, true);
+    return ConstantInt::get(Type::getInt64Ty(*TheContext), node.info, true);
   case N_DOUBLE:
-    return ConstantFP::get(Type::getDoubleTy(*TheContext), APFloat(node.as.dnumber));
+    return ConstantFP::get(Type::getDoubleTy(*TheContext), APFloat((double)node.info));
   case N_STRING: {
-    Constant* StrVal = ConstantDataArray::getString(*TheContext, global_strings[node.as.inumber], true); // true = null terminated
+    Constant* StrVal = ConstantDataArray::getString(*TheContext, global_strings[node.info], true); // true = null terminated
     ArrayType* StrType = cast<ArrayType>(StrVal->getType());
-		static char strName[256] = { 0 };
-    sprintf(strName, ".%d", node.as.inumber);
+    static char strName[256] = { 0 };
+    sprintf(strName, ".%llu", node.info);
+    Constant* var = TheModule->getOrInsertGlobal(strName, StrType);
+    return ConstantExpr::getInBoundsGetElementPtr(StrType, var, Zeros);
+  }
+  case N_ARRAY: {
+    auto array = global_nodes.front();
+    global_nodes.pop_front();
+
+    Type* elemType = Type::getInt64Ty(*TheContext);
+    ArrayType* arrayType = nullptr;
+    if (isGlobal) cupError("Global arrays are not supported yet");
+    Function* TheFunction = Builder->GetInsertBlock()->getParent();
+
+    if (array.type != N_COMMA) {
+      arrayType = ArrayType::get(elemType, 1);
+      Value* allocaInst = CreateEntryBlockAlloca(TheFunction, arrayType);
+      auto val = codegen(array);
+      if (val->getType() != elemType) {
+        val = Builder->CreateBitCast(val, elemType); // Optional: ensure matching type
+      }
+      Builder->CreateStore(val, allocaInst);
+      return allocaInst; // pointer to the array
+    }
+    else {
+      arrayType = ArrayType::get(elemType, array.info);
+      Value* allocaInst = CreateEntryBlockAlloca(TheFunction, arrayType);
+      auto first = global_nodes.front();
+      global_nodes.pop_front();
+      auto val = codegen(first);
+      if (!val)
+        return nullptr;
+      if (val->getType() != elemType) {
+        val = Builder->CreateBitCast(val, elemType); // Optional: ensure matching type
+      }
+      Builder->CreateStore(val, allocaInst);
+      for (size_t i = 1; i < array.info; ++i) {
+        Value* ptr = Builder->CreateInBoundsGEP(
+          arrayType->getElementType(), allocaInst,
+          ConstantInt::get(Type::getInt64Ty(*TheContext), i));
+
+        auto n = global_nodes.front();
+        global_nodes.pop_front();
+        auto val = codegen(n);
+        if (!val)
+          return nullptr;
+
+        if (val->getType() != elemType) {
+          val = Builder->CreateBitCast(val, elemType); // Optional: ensure matching type
+        }
+
+        Builder->CreateStore(val, ptr);
+      }
+      return allocaInst; // pointer to the array
+    }
+  }
+  case N_RETURN: {
+    auto code = global_nodes.front();
+    global_nodes.pop_front();
+    auto val = codegen(code);
+    if (!val)
+      return nullptr;
+    return Builder->CreateRet(val);
+  }
+  case N_EQEQ: {
+    auto left = global_nodes.front();
+    global_nodes.pop_front();
+    Value* L = codegen(left);
+    if (!L)
+      return nullptr;
+    auto right = global_nodes.front();
+    global_nodes.pop_front();
+    Value* R = codegen(right);
+    if (!R)
+      return nullptr;
+
+    Type* LTy = L->getType();
+    Type* RTy = R->getType();
+    // Make sure both operands are of the same type
+    if (LTy != RTy) {
+      if (LTy->isIntegerTy() && RTy->isDoubleTy()) {
+        L = Builder->CreateSIToFP(L, RTy, "inttofp");
+      }
+      else if (LTy->isDoubleTy() && RTy->isIntegerTy()) {
+        R = Builder->CreateSIToFP(R, LTy, "inttofp");
+      }
+      else if (LTy->isPointerTy()) {
+        L = Builder->CreatePtrToInt(L, RTy, "ptrtoint");
+      }
+      else {
+        abort();
+        cupError("Incompatible types for binary operator");
+      }
+    }
+
+    bool isFloat = LTy->isFloatingPointTy();
+    return isFloat ? Builder->CreateFCmpOEQ(L, R, "eqtmp") : Builder->CreateICmpEQ(L, R, "eqtmp");
+  }
+  case N_VARIABLE: {
+    const char* name = global_strings[node.info];
+    Value* V = findvar(name, this_scope);
+    if (V == nullptr) {
+      for (auto& G : TheModule->functions()) {
+        if (strcmp(G.getName().data(), name) == 0) {
+          return &G;
+        }
+      }
+      cupErrorf("Unknown variable '%s'\n", name);
+    }
+
+    if (auto A = dyn_cast<AllocaInst>(V)) {
+      Type* allocTy = A->getAllocatedType();
+      //return A;
+      if (allocTy->isArrayTy()) {
+        return A;  // Return the array pointer directly
+      }
+      return Builder->CreateLoad(allocTy, A);
+    }
+
+    if (auto G = dyn_cast<GlobalVariable>(V)) {
+      Type* gvTy = G->getValueType();
+      if (gvTy->isArrayTy()) {
+        // Create GEP for array pointer with explicit source type
+        return Builder->CreateInBoundsGEP(
+          gvTy,     // Source element type (array type)
+          G,        // Global variable pointer
+          { Zero, Zero },
+          name
+        );
+      }
+      if (isGlobal)
+        return G->getInitializer();
+      return Builder->CreateLoad(gvTy, G, "loadtmp");
+    }
+
+    if (auto F = dyn_cast<Function>(V)) {
+      return F;
+    }
+
+    cupErrorf("Unknown variable storage for \"%s\"", name);
+    return nullptr;
+  }
+  case N_ASSIGN: {
+    Node left = global_nodes.front();
+    global_nodes.pop_front();
+
+    if (left.type != N_VARIABLE)
+      cupErrorf("codegenassign: unhandled node type %n\n", node);
+    const char* name = global_strings[left.info];
+    auto var = findvar(name, this_scope);
+
+    Node right = global_nodes.front();
+    global_nodes.pop_front();
+
+    Value* val = codegen(right);
+    if (!val)
+      return nullptr;
+
+    if (isGlobal) {
+      // Глобальная переменная
+      GlobalVariable* gvar = dyn_cast_or_null<GlobalVariable>(var);
+      if (gvar == nullptr) {
+        gvar = new GlobalVariable(
+          *TheModule, val->getType(), false, GlobalValue::ExternalLinkage,
+          Constant::getNullValue(val->getType()), name);
+        this_scope->variables.insert({ name , { gvar } });
+      }
+      if (!isa<Constant>(val))
+        cupError("Global initializer must be constant");
+      gvar->setInitializer(cast<Constant>(val));
+      return gvar;
+    }
+    else {
+      Function* TheFunction = Builder->GetInsertBlock()->getParent();
+      // Локальная переменная
+      if (var == nullptr) {
+        AllocaInst* Alloca = nullptr;
+        if (auto A = dyn_cast<AllocaInst>(val)) {
+          Alloca = A;
+        }
+        else {
+          Alloca = CreateEntryBlockAlloca(TheFunction, val->getType());
+        }
+        if (val->getType()->isArrayTy()) {
+          cupError("Arrays are not supported yet");
+          ArrayType* arrayType = cast<ArrayType>(val->getType());
+          for (unsigned i = 0; i < arrayType->getNumElements(); ++i) {
+            Value* element = Builder->CreateExtractValue(val, i);
+            Value* elemPtr = Builder->CreateInBoundsGEP(
+              arrayType->getElementType(), Alloca, ConstantInt::get(Type::getInt64Ty(*TheContext), i));
+            Builder->CreateStore(element, elemPtr);
+          }
+          this_scope->variables.insert({ name, { Alloca } });
+          return val;
+        }
+        this_scope->variables.insert({ name, { Alloca } });
+        var = Alloca;
+      }
+      if (val != var)
+      {
+        Builder->CreateStore(val, var);
+      }
+      return val;
+    }
+    cupErrorf("Assignments are not supported yet \n%n\n", right);
+  }
+  case N_CALL: {
+    auto left = global_nodes.front();
+    global_nodes.pop_front();
+
+    if (left.type != N_VARIABLE) {
+      cupError("Invalid function call");
+    }
+
+    const char* name = global_strings[left.info];
+    Value* V = findvar(name, this_scope);
+    if (V != nullptr) {
+      cupErrorf("Function name conflicts with variable name");
+    }
+
+    auto args = global_nodes.front();
+    global_nodes.pop_front();
+
+    std::vector<Value*> argsvalues;
+    size_t varargs = codegenargs(args, argsvalues);
+
+    Function* F = TheModule->getFunction(name);
+    if (!F) {
+      std::vector<Type*> paramTypes;
+      for (size_t i = 0; i < argsvalues.size(); i++) {
+        if (i == varargs)
+          break;
+        paramTypes.push_back(argsvalues[i]->getType());
+      }
+      FunctionType* FT = FunctionType::get(Type::getInt64Ty(*TheContext), paramTypes, varargs != -1);
+      F = Function::Create(FT, Function::ExternalLinkage, name, TheModule.get());
+    }
+
+    if (F->arg_size() != argsvalues.size() && varargs == -1)
+      cupErrorf("Incorrect number of arguments passed: expected %z, got %z",
+        F->arg_size(), argsvalues.size());
+
+    if (isGlobal)
+      return F;
+
+    for (unsigned i = 0; i < F->arg_size(); i++) {
+      Value* arg = argsvalues[i];
+      Type* expectedType = F->getFunctionType()->getParamType(i);
+      if (arg->getType() != expectedType) {
+        cupError("Invalid argument type passed to function");
+      }
+    }
+
+    return Builder->CreateCall(F, argsvalues, "calltmp");
+  }
+  case N_BLOCK: {
+    Scope* scope = new Scope();
+    scope->parent = this_scope;
+    this_scope = scope;
+
+    Value* val = nullptr;
+    for (size_t i = 0; i < node.info; i++) {
+      auto node = global_nodes.front();
+      global_nodes.pop_front();
+      val = codegen(node);
+      if (!val) return nullptr;
+    }
+    this_scope = scope->parent;
+    return val;
+  }
+  case N_FUNCTION: {
+    Node var = global_nodes.front();
+    global_nodes.pop_front();
+
+    if (var.type != N_VARIABLE)
+      cupErrorf("codegenfunction: not a variable %n\n", var);
+
+    const char* name = global_strings[var.info];
+
+    Node args = global_nodes.front();
+    global_nodes.pop_front();
+
+    std::vector<const char*> argNames;
+    std::vector<Type*> argTypes;
+
+    Type* returnType = Type::getInt64Ty(*TheContext);
+
+    if (auto* F = TheModule->getFunction(name)) {
+      cupError("Function already defined");
+      return F;
+    }
+    if (args.type == N_COMMA) {
+      for (size_t i = 0; i < args.info; i++) {
+        auto n = global_nodes.front();
+        global_nodes.pop_front();
+        if (n.type == N_VARIABLE) {
+          argNames.push_back(global_strings[n.info]);
+          argTypes.push_back(Type::getInt64Ty(*TheContext));
+          continue;
+        }
+        cupErrorf("codegenfunction: typedefargs: unhandled node type %n\n", n);
+      }
+    }
+    else {
+      cupErrorf("codegenfunction: %s\n%n\n", name, args);
+    }
+
+    FunctionType* funcType = FunctionType::get(returnType, argTypes, false);
+    Function* function = Function::Create(funcType, Function::ExternalLinkage, name, *TheModule);
+
+    BasicBlock* BB = BasicBlock::Create(*TheContext, "entry", function);
+    Builder->SetInsertPoint(BB);
+
+    this_scope->variables.insert({ name, { function } });
+
+    Scope* scope = new Scope();
+    scope->parent = this_scope;
+    this_scope = scope;
+
+    // Set parameter names
+    unsigned idx = 0;
+    for (auto& arg : function->args()) {
+      if (idx < argNames.size()) {
+        arg.setName(argNames[idx]);
+        AllocaInst* a = Builder->CreateAlloca(arg.getType());
+        Builder->CreateStore(&arg, a);
+        this_scope->variables.insert({ argNames[idx], { a } });
+        idx++;
+      }
+    }
+
+    auto body = global_nodes.front();
+    global_nodes.pop_front();
+    Value* bodyVal = codegen(body);
+    if (!bodyVal) {
+      function->eraseFromParent();
+      return nullptr;
+    }
+
+    if (!Builder->GetInsertBlock()->getTerminator()) {
+      Builder->CreateRet(ConstantInt::get(returnType, 0));
+    }
+
+    verifyFunction(*function);
+
+    // function->print(errs());
+
+    this_scope = scope->parent;
+
+    return function;
+  }
+  case N_IF: case N_IFELSE: {
+    auto cond = global_nodes.front();
+    global_nodes.pop_front();
+
+    Value* condVal = codegen(cond);
+    if (!condVal)
+      return nullptr;
+
+    // Convert condition to a bool i1 if needed (assuming condVal is i64 or something else)
+    if (condVal->getType()->isIntegerTy() && condVal->getType()->getIntegerBitWidth() != 1) {
+      condVal = Builder->CreateICmpNE(condVal, Zero, "ifcond");
+    }
+
+    Function* TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // Create blocks for then, else, and merge
+    BasicBlock* ThenBB = BasicBlock::Create(*TheContext, "then", TheFunction);
+    BasicBlock* MergeBB = BasicBlock::Create(*TheContext, "ifcont", TheFunction);
+    BasicBlock* ElseBB = MergeBB;
+
+    if (node.type == N_IFELSE) {
+      ElseBB = BasicBlock::Create(*TheContext, "else", TheFunction);
+    }
+
+    Builder->CreateCondBr(condVal, ThenBB, ElseBB);
+
+    Builder->SetInsertPoint(ThenBB);
+
+    auto then = global_nodes.front();
+    global_nodes.pop_front();
+    Value* ThenVal = codegen(then);
+    if (!ThenVal) return nullptr;
+
+    if (!ThenBB->getTerminator()) {
+      Builder->CreateBr(MergeBB);// Jump to merge after then
+    }
+
+    Value* ElseVal = nullptr;
+    if (ElseBB != MergeBB) {
+      Builder->SetInsertPoint(ElseBB);
+      auto elseNode = global_nodes.front();
+      global_nodes.pop_front();
+      ElseVal = codegen(elseNode);
+      if (!ElseVal) return nullptr;
+      if (!ElseBB->getTerminator()) {
+        Builder->CreateBr(MergeBB);// Jump to merge after else
+      }
+    }
+
+    Builder->SetInsertPoint(MergeBB);
+    if (ThenVal->getType()->isVoidTy())
+      return Zero;
+    PHINode* PN = Builder->CreatePHI(ThenVal->getType(), ElseVal ? 2 : 1, "iftmp");
+    PN->addIncoming(ThenVal, ThenBB);
+    if (ElseVal) PN->addIncoming(ElseVal, ElseBB);
+    else PN->addIncoming(Constant::getNullValue(ThenVal->getType()), ThenBB);
+    return PN;
+  }
+  case N_WHILE: {
+    if (isGlobal)
+      cupError("Global while is not supported");
+    Function* TheFunction = Builder->GetInsertBlock()->getParent();
+
+    BasicBlock* loop_cond = BasicBlock::Create(*TheContext, "loop_cond", TheFunction);
+    BasicBlock* loop_body = BasicBlock::Create(*TheContext, "loop_body", TheFunction);
+    BasicBlock* after_loop = BasicBlock::Create(*TheContext, "after_loop", TheFunction);
+    Builder->CreateBr(loop_cond);
+
+    Builder->SetInsertPoint(loop_cond);
+
+    Scope* scope = new Scope();
+    scope->parent = this_scope;
+    this_scope = scope;
+
+    auto cond = global_nodes.front();
+    global_nodes.pop_front();
+
+    Value* condVal = codegen(cond);
+    if (!condVal)
+      return nullptr;
+
+    if (condVal->getType() == Type::getInt64Ty(*TheContext))
+      condVal = Builder->CreateICmpNE(condVal, ConstantInt::get(*TheContext, APInt(64, 0)), "loop_cond");
+    Builder->CreateCondBr(condVal, loop_body, after_loop);
+
+    Builder->SetInsertPoint(loop_body);
+
+    auto body = global_nodes.front();
+    global_nodes.pop_front();
+    auto bodyVal = codegen(body);
+    if (!bodyVal)
+      return nullptr;
+    Builder->CreateBr(loop_cond);
+    Builder->SetInsertPoint(after_loop);
+    this_scope = scope->parent;
+    return bodyVal;
+  }
+  default:
+    cupErrorf("codegen: Unknown node type %n\n", node);
+    return nullptr;
+  }
+}
+
+/*
+Value* codegen() {
+  static Constant* Zero = ConstantInt::get(Type::getInt64Ty(*TheContext), 0);
+  bool isGlobal = (Builder->GetInsertBlock() == nullptr);
+
+  auto node = global_nodes.front();
+  global_nodes.pop_front();
+
+  switch (node.type) {
+  case N_NUMBER:
+    return ConstantInt::get(Type::getInt64Ty(*TheContext), node.info, true);
+  case N_DOUBLE:
+    return ConstantFP::get(Type::getDoubleTy(*TheContext), APFloat((double)node.info));
+  case N_STRING: {
+    Constant* StrVal = ConstantDataArray::getString(*TheContext, global_strings[node.info], true); // true = null terminated
+    ArrayType* StrType = cast<ArrayType>(StrVal->getType());
+    static char strName[256] = { 0 };
+    sprintf(strName, ".%d", node.info);
     Constant* var = TheModule->getOrInsertGlobal(strName, StrVal->getType());
     std::vector<Constant*> indices;
     indices.push_back(Zero);
-		indices.push_back(Zero);
+    indices.push_back(Zero);
     return ConstantExpr::getInBoundsGetElementPtr(
       StrType,  // Source type (array type)
       var,     // Pointer to global string
       indices   // Indices
     );
   }
+  case N_OBJECT: {
+    return codegenobject(node);
+  }
   case N_ARRAY: {
-    size_t arraySize = node.nodes.size();
-    if (arraySize == 0)
+    if (node.nodes.size() == 0)
       cupError("Empty arrays are not supported yet");
-
-    std::vector<Value*> elements;
-    for (auto& child : node.nodes) {
-      Value* val = codegen(child, nullptr);
-      if (!val)
-        return nullptr;
-      elements.push_back(val);
+    auto front = node.nodes.front();
+    auto nodes = node.nodes;
+    if (front.type == N_OPERATOR && front.as.token == T_COMMA) {
+      nodes = front.nodes;
+    }
+    else {
+      nodes = node.nodes;
     }
 
-    Type* elemType = elements[0]->getType();
+    Type* elemType = Type::getInt64Ty(*TheContext);
+    ArrayType* arrayType = ArrayType::get(elemType, nodes.size());
 
-    // Ensure all elements are of the same type
-    for (Value* v : elements) {
-      if (v->getType() != elemType) {
-        cupError("Array elements must have the same type");
-      }
-    }
-
-    ArrayType* arrayType = ArrayType::get(elemType, arraySize);
     if (isGlobal) cupError("Global arrays are not supported yet");
 
-    // Create an UndefValue as a placeholder for our array
-    Value* arrayValue = UndefValue::get(arrayType);
+    Function* TheFunction = Builder->GetInsertBlock()->getParent();
+    Value* allocaInst = CreateEntryBlockAlloca(TheFunction, arrayType);
 
-    // Insert each element into the array
-    for (unsigned i = 0; i < arraySize; ++i) {
-      // Use InsertValue to build the array (no memory allocation yet)
-      arrayValue = Builder->CreateInsertValue(arrayValue, elements[i], i);
+    {
+      //% 6 = load i32, ptr % 1, align 4
+        // store i32 % 6, ptr % 4, align 4
+      auto val = codegen(nodes[0], nullptr);
+      if (val->getType() != elemType) {
+        val = Builder->CreateBitCast(val, elemType); // Optional: ensure matching type
+      }
+      Builder->CreateStore(val, allocaInst);
     }
 
-    // Now we have an array value that can be assigned using codegenassign
-    // The caller (likely codegenassign) will handle the actual allocation
-    return arrayValue;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      //% 8 = getelementptr inbounds i32, ptr % 4, i64 2
+        //  % 9 = load i32, ptr % 2, align 4
+        // store i32 % 9, ptr % 8, align 4
+
+      Value* ptr = Builder->CreateInBoundsGEP(
+        arrayType->getElementType(), allocaInst, ConstantInt::get(Type::getInt64Ty(*TheContext), i));
+      auto val = codegen(nodes[i], nullptr);
+
+      if (val->getType() != elemType) {
+        val = Builder->CreateBitCast(val, elemType); // Optional: ensure matching type
+      }
+
+      Builder->CreateStore(val, ptr);
+    }
+
+    return allocaInst; // pointer to the array
+
+    //Value* arrayValue = UndefValue::get(arrayType);
+    //return arrayValue;
   }
   case N_SUBSCRIPT: {
     if (node.nodes.size() != 2) {
@@ -807,8 +1296,7 @@ Value* codegen(Node node, Type* type) {
     if (!arrayPtr || !index)
       cupError("Invalid subscript operation");
 
-    // Prepare zero index
-    Value* zero = ConstantInt::get(Type::getInt64Ty(*TheContext), 0);
+    arrayPtr->print(errs());
 
     // With opaque pointers, we need to know the element type explicitly
     // We need to infer the element type from the context
@@ -837,15 +1325,14 @@ Value* codegen(Node node, Type* type) {
     }
 
     // % arrayidx = getelementptr inbounds i64, ptr% ppp_val, i64 0
-		auto gep = Builder->CreateInBoundsGEP(
-			arrayTy, arrayPtr, { zero, index }, "arrayidx");
-		// %first_elem_val = load i64, ptr %first_elem_ptr, align 8
-		auto load = Builder->CreateLoad(elemTy, gep, "loadtmp");
-    return load;
+    auto gep = Builder->CreateInBoundsGEP(
+      arrayTy, arrayPtr, { Zero, index }, "arrayidx");
+    // %first_elem_val = load i64, ptr %first_elem_ptr, align 8
+    return Builder->CreateLoad(elemTy, gep, "loadtmp");
   }
   case N_IF: {
     if (node.nodes.size() < 2)
-			cupError("Invalid if statement");
+      cupError("Invalid if statement");
 
     Value* condVal = codegen(node.nodes[0], nullptr);
     if (!condVal)
@@ -866,7 +1353,7 @@ Value* codegen(Node node, Type* type) {
     if (node.nodes.size() > 2) {
       ElseBB = BasicBlock::Create(*TheContext, "else", TheFunction);
     }
-    
+
     Builder->CreateCondBr(condVal, ThenBB, ElseBB);
 
     Builder->SetInsertPoint(ThenBB);
@@ -902,16 +1389,23 @@ Value* codegen(Node node, Type* type) {
     const char* name = global_strings[node.as.inumber];
     Value* V = findvar(name, node.scope);
     if (V == nullptr) {
+      // Check if it's a global variable
+      for (auto& G : TheModule->functions()) {
+        printf("%s\n", G.getName().data());
+        if (strcmp(G.getName().data(), name) == 0) {
+          return &G;
+        }
+      }
       cupErrorf("Unknown variable '%s'\n", name);
-			return nullptr;
     }
 
     if (auto A = dyn_cast<AllocaInst>(V)) {
       Type* allocTy = A->getAllocatedType();
+      //return A;
       if (allocTy->isArrayTy()) {
         return A;  // Return the array pointer directly
       }
-      return Builder->CreateLoad(allocTy, A, name);
+      return Builder->CreateLoad(allocTy, A);
     }
 
     if (auto G = dyn_cast<GlobalVariable>(V)) {
@@ -930,20 +1424,40 @@ Value* codegen(Node node, Type* type) {
       return Builder->CreateLoad(gvTy, G, "loadtmp");
     }
 
+    if (auto F = dyn_cast<Function>(V)) {
+      return F;
+    }
+
     cupErrorf("Unknown variable storage for \"%s\"", name);
     return nullptr;
   }
+  case N_ADD: {
+
+    Value* L = codegen(node.nodes.front(), nullptr);
+    Value* R = codegen(node.nodes.back(), nullptr);
+  }
+
   case N_OPERATOR:
   {
     if (node.as.token == T_EQ) return codegenassign(node, T_EQ);
+
+    if (node.as.token == T_COMMA) {
+      Value* val = nullptr;
+      for (auto it : node.nodes) {
+        val = codegen(it, nullptr);
+        if (!val)
+          return nullptr;
+      }
+      return val;
+    }
 
     Value* L = codegen(node.nodes.front(), nullptr);
     Value* R = codegen(node.nodes.back(), nullptr);
     if (!L || !R)
       return nullptr;
 
-		Type* LTy = L->getType();
-		Type* RTy = R->getType();
+    Type* LTy = L->getType();
+    Type* RTy = R->getType();
     // Make sure both operands are of the same type
     if (LTy != RTy) {
       if (LTy->isIntegerTy() && RTy->isDoubleTy()) {
@@ -953,9 +1467,10 @@ Value* codegen(Node node, Type* type) {
         R = Builder->CreateSIToFP(R, LTy, "inttofp");
       }
       else if (LTy->isPointerTy()) {
-				L = Builder->CreatePtrToInt(L, RTy, "ptrtoint");
+        L = Builder->CreatePtrToInt(L, RTy, "ptrtoint");
       }
       else {
+        abort();
         cupError("Incompatible types for binary operator");
       }
     }
@@ -1008,21 +1523,22 @@ Value* codegen(Node node, Type* type) {
   }
   case N_CALL: {
     if (node.nodes.size() != 2) {
-			cupError("Invalid function call");
+      cupError("Invalid function call");
     }
     if (node.nodes.front().type != N_VARIABLE) {
-			cupError("Invalid function call");
+      cupError("Invalid function call");
     }
     const char* name = global_strings[node.nodes.front().as.inumber];
     Value* V = findvar(name, node.scope);
     if (V != nullptr) {
-			cupErrorf("Function name conflicts with variable name");
+      cupErrorf("Function name conflicts with variable name");
     }
 
     Node argsNode = node.nodes.back();
     std::vector<Value*> args;
     size_t varargs = -1;
 
+    cupError("codegenfunction: codegenargs");
     codegenargs(argsNode, args, varargs);
 
     Function* F = TheModule->getFunction(name);
@@ -1031,18 +1547,18 @@ Value* codegen(Node node, Type* type) {
       std::vector<Type*> paramTypes;
       for (size_t i = 0; i < args.size(); i++) {
         if (i == varargs)
-					break;
+          break;
         paramTypes.push_back(args[i]->getType());
       }
-			FunctionType* FT = nullptr;
+      FunctionType* FT = nullptr;
       if (type)
       {
         FT = FunctionType::get(type, paramTypes, varargs != -1);
-			}
-			else
-			{
-				FT = FunctionType::get(Type::getInt64Ty(*TheContext), paramTypes, varargs != -1);
-			}
+      }
+      else
+      {
+        FT = FunctionType::get(Type::getInt64Ty(*TheContext), paramTypes, varargs != -1);
+      }
       F = Function::Create(FT, Function::ExternalLinkage, name, TheModule.get());
     }
 
@@ -1052,7 +1568,7 @@ Value* codegen(Node node, Type* type) {
 
     if (isGlobal)
     {
-      cupError("Cannot call function from global scope");
+      return F;
     }
     for (unsigned i = 0; i < F->arg_size(); i++) {
       Value* arg = args[i];
@@ -1088,11 +1604,35 @@ Value* codegen(Node node, Type* type) {
     return lastVal;
   }
   case N_FUNCTION: {
-		return codegenfunction(node);
+    return codegenfunction(node);
   }
   case N_CONTROLFLOW: {
     if (node.as.token == T_RETURN) {
       return Builder->CreateRet(codegen(node.nodes.front(), nullptr));
+    }
+    if (node.as.token == T_WHILE) {
+      Function* TheFunction = Builder->GetInsertBlock()->getParent();
+
+      BasicBlock* loop_cond = BasicBlock::Create(*TheContext, "loop_cond", TheFunction);
+      BasicBlock* loop_body = BasicBlock::Create(*TheContext, "loop_body", TheFunction);
+      BasicBlock* after_loop = BasicBlock::Create(*TheContext, "after_loop", TheFunction);
+      Builder->CreateBr(loop_cond);
+
+      Builder->SetInsertPoint(loop_cond);
+      Value* cond = codegen(node.nodes.front(), nullptr);
+      if (!cond)
+        return nullptr;
+
+      if (cond->getType() == Type::getInt64Ty(*TheContext))
+        cond = Builder->CreateICmpNE(cond, ConstantInt::get(*TheContext, APInt(64, 0)), "loop_cond");
+      Builder->CreateCondBr(cond, loop_body, after_loop);
+
+      Builder->SetInsertPoint(loop_body);
+      codegen(node.nodes.back(), nullptr);
+      Builder->CreateBr(loop_cond);
+
+      Builder->SetInsertPoint(after_loop);
+      return cond;
     }
     // if (node.as.token == T_BREAK) {
       // Builder->CreateBr(nullptr);
@@ -1105,32 +1645,31 @@ Value* codegen(Node node, Type* type) {
     return nullptr;
   }
 }
+*/
 
-Value* codegenModule(Node& node) {
+Value* codegenModule() {
   bool dump_strings = true;
   if (dump_strings)
-  for (size_t i = 0; i < global_strings.size(); i++) {
-    Constant* Val = ConstantDataArray::getString(*TheContext, global_strings[i], true);
-    static char Name[256] = { 0 };
-		sprintf(Name, ".%d", i);
-		new GlobalVariable(
-			*TheModule, Val->getType(), true, // isConstant
-			GlobalValue::PrivateLinkage, Val, Name
-		);
-  }
-	Value* val = nullptr;
-
-  for (Node& it : node.nodes) {
-    if (it.type == N_CONTROLFLOW && it.as.token == T_RETURN) {
-      // Generate external variables to module
-      cupError("return not implemented yet");
-      return nullptr;
+    for (size_t i = 0; i < global_strings.size(); i++) {
+      Constant* Val = ConstantDataArray::getString(*TheContext, global_strings[i], true);
+      static char Name[256] = { 0 };
+      sprintf(Name, ".%llu", i);
+      new GlobalVariable(
+        *TheModule, Val->getType(), true, // isConstant
+        GlobalValue::PrivateLinkage, Val, Name
+      );
     }
-    val = codegen(it, nullptr);
+
+  Value* val = nullptr;
+
+  while (!global_nodes.empty()) {
+    auto node = global_nodes.front();
+    global_nodes.pop_front();
+    val = codegen(node);
     if (!val) return nullptr;
   }
 
-	return val;
+  return val;
 }
 
 std::ostream& operator<<(std::ostream& os, const Token t) {
@@ -1138,19 +1677,19 @@ std::ostream& operator<<(std::ostream& os, const Token t) {
   case T_EOF: return os << "eof";
   case T_NL: return os << "nl";
   case T_IDENTIFIER: return os << "identifier";
-	case T_NUMBER: return os << "number";
-	case T_DOUBLE: return os << "double";
-	case T_STRING: return os << "string";
+  case T_NUMBER: return os << "number";
+  case T_DOUBLE: return os << "double";
+  case T_STRING: return os << "string";
   case T_MSTRING: return os << "mstring";
   case T_RANGE: return os << "range";
-	case T_ADDEQ: return os << "+=";
-	case T_SUBEQ: return os << "-=";
-	case T_MULEQ: return os << "*=";
-	case T_DIVEQ: return os << "/=";
-	case T_MODEQ: return os << "%=";
-	case T_ANDEQ: return os << "&=";
-	case T_OREQ: return os << "|=";
-	case T_XOREQ: return os << "^=";
+  case T_ADDEQ: return os << "+=";
+  case T_SUBEQ: return os << "-=";
+  case T_MULEQ: return os << "*=";
+  case T_DIVEQ: return os << "/=";
+  case T_MODEQ: return os << "%=";
+  case T_ANDEQ: return os << "&=";
+  case T_OREQ: return os << "|=";
+  case T_XOREQ: return os << "^=";
   case T_LESSEQ: return os << "<=";
   case T_GREATEQ: return os << ">=";
   case T_NOTEQ: return os << "!=";
@@ -1160,89 +1699,31 @@ std::ostream& operator<<(std::ostream& os, const Token t) {
   }
 }
 std::ostream& operator<<(std::ostream& os, const Node n) {
-  if (n.scope == nullptr) {
-    os << " ### ";
-  }
+  double* d = (double*)&n.info;
   switch (n.type) {
   default:          return os << "{ " << n.type << " }";
-  case N_OBJECT:
-    cupError("object not implemented yet");
-  case N_NUMBER:    return os << "{ number " << n.as.inumber << " }";
-  case N_DOUBLE:    return os << "{ float " << n.as.dnumber << " }";
-  case N_STRING:    return os << "{ string \"" << global_strings[n.as.inumber] << "\" }";
-  case N_VARIABLE:  return os << "{ variable " << global_strings[n.as.inumber] << " }";
-  case N_ARRAY:
-    os << "{ array [ ";
-    for (auto it : n.nodes) {
-      os << it << " ";
-    }
-    return os << "] }";
-  case N_CALL:
-    return os << "{ call " << n.nodes.front() << " ( " << n.nodes.back() << " ) }";
-  case N_SUBSCRIPT:
-    return os << "{ subscript " << n.nodes.front() << " [ " << n.nodes.back() << " ] }";
-  case N_MEMBER:
-    return os << "{ member " << n.nodes.front() << " -> " << n.nodes.back() << " }";
-  case N_OPERATOR: {
-		os << "{ operator ";
-    auto it = n.nodes.begin();
-
-    if (it != n.nodes.end()) {
-      for (;;)
-      {
-        os << *(it++);
-        if (it == n.nodes.end())
-          break;
-        os << " " << n.as.token << " ";
-      }
-    }
-		return os << " }";
-  }
-  case N_FUNCTION:
-    return os << "{ function " << n.nodes.front() << n.nodes.back() << " }";
-  case N_COMMA:
-    os << "{ comma ";
-    for (auto it = n.nodes.cbegin(); it != n.nodes.cend(); it++) {
-      if (it != n.nodes.cbegin())
-        os << ", ";
-      os << *it;
-    }
-    return os << " }";
-  case N_BLOCK:
-    os << "{ block ";
-    for (auto it : n.nodes) {
-      os << it << " ";
-    }
-    return os << "}";
-  case N_IF:
-    if (n.nodes.size() != 3) {
-      return os << "{ if ( " << n.nodes.front() << " ) "
-        << n.nodes.back() << " }";
-    }
-    else {
-      return os << "{ if ( " << n.nodes.front() << " ) "
-        << n.nodes[1] << " else " << n.nodes.back() << " }";
-    }
-  case N_FOR:
-    return os << "{ for ( " << n.nodes.front() << " ) " << n.nodes.back() << " }";
-  case N_CONTROLFLOW:
-    if (n.as.token == T_RETURN) {
-      return os << "{ return " << n.nodes.front() << " }";
-    }
-    else if (n.as.token == T_CONTINUE) {
-      return os << "{ continue }";
-    }
-    else if (n.as.token == T_BREAK) {
-      return os << "{ break }";
-    }
-    else {
-      cupErrorf("Unknown control flow '%t'", n.as.token);
-    }
+  case N_COMMA:     return os << "{ comma " << n.info << " }";
+  case N_ADD:       return os << "{ + }";
+  case N_SUB:       return os << "{ - }";
+  case N_MUL:       return os << "{ * }";
+  case N_DIV:       return os << "{ / }";
+  case N_MOD:       return os << "{ % }";
+  case N_AND:       return os << "{ & }";
+  case N_OR:        return os << "{ | }";
+  case N_XOR:       return os << "{ ^ }";
+  case N_ASSIGN:    return os << "{ = }";
+  case N_CALL:      return os << "{ call }";
+  case N_BLOCK:     return os << "{ block " << n.info << " }";
+  case N_FUNCTION:  return os << "{ function }";
+  case N_NUMBER:    return os << "{ number " << n.info << " }";
+  case N_DOUBLE:    return os << "{ float " << *d << " }";
+  case N_STRING:    return os << "{ string \"" << global_strings[n.info] << "\" }";
+  case N_VARIABLE:  return os << "{ variable " << global_strings[n.info] << " }";
   }
 }
 
 void cupErrorf(const char* format...) {
-	static char buf[32] = {};
+  static char buf[32] = {};
   fwrite("ERROR: ", 7, 1, stderr);
   va_list args;
   va_start(args, format);
@@ -1263,10 +1744,10 @@ void cupErrorf(const char* format...) {
     }
     if (c == 'i')
     {
-			int i = va_arg(args, int);
-			sprintf(buf, "%i", i);
-			fwrite(buf, strlen(buf), 1, stderr);
-			continue;
+      int i = va_arg(args, int);
+      sprintf(buf, "%i", i);
+      fwrite(buf, strlen(buf), 1, stderr);
+      continue;
     }
     if (c == 's') {
       const char* ptr = va_arg(args, char*);
@@ -1284,7 +1765,7 @@ void cupErrorf(const char* format...) {
       continue;
     }
     if (c == 't') {
-			std::cerr << va_arg(args, Token) << std::flush;
+      std::cerr << va_arg(args, Token) << std::flush;
       continue;
     }
     if (c == 'v') {
@@ -1412,9 +1893,9 @@ Token getToken(bool newlines) {
         const char c = *file.ptr;
         if (c == '_')
           continue;
-        token_num = token_num * 16 + (c >= 'a' && c <= 'f') ? (c - 87)
-          : (c >= 'A' && c <= 'F') ? (c - 55)
+        size_t c_int = (c >= 'a' && c <= 'f') ? (c - 87) : (c >= 'A' && c <= 'F') ? (c - 55)
           : (c - '0');
+        token_num = (token_num * 16) + c_int;
       }
       return T_NUMBER;
     }
@@ -1523,17 +2004,22 @@ Token getNextToken(bool newlines) {
   return CurTok = getToken(newlines);
 }
 
-const Node parse() {
+const void parse() {
   getNextToken(true);
-  root.scope = this_scope;
+  //root.scope = this_scope;
+  global_nodes.push_back({ N_BLOCK });
 
   while (CurTok != T_EOF) {
-    root.nodes.push_back(statement());
+    auto right = statement();
+    if (right.empty())
+      continue;
+    global_nodes.insert(global_nodes.end(), right.begin(), right.end());
+    global_nodes.front().info++;
   }
 
-  std::cout << root << std::endl;
-
-  return root;
+  for (auto n : global_nodes) {
+    std::cout << n << std::endl;
+  }
 }
 
 const std::pair<uint8_t, uint8_t> getPower(Token t) {
@@ -1542,7 +2028,7 @@ const std::pair<uint8_t, uint8_t> getPower(Token t) {
     cupErrorf("unknown operator '%t'", t);
 
   case T_ORB:
-		cupError("unknown T_ORB");
+    cupError("unknown T_ORB");
 
   case T_EOF:
   case T_CRB:
@@ -1552,7 +2038,7 @@ const std::pair<uint8_t, uint8_t> getPower(Token t) {
     return { 0, 0 };
 
   case T_OCB:
-		return { 0, 0 };
+    return { 0, 0 };
 
   case T_COMMA:
     return { 1, 2 };
@@ -1596,113 +2082,103 @@ const std::pair<uint8_t, uint8_t> getPower(Token t) {
   }
 }
 
+const uint8_t getMaxPower = 17;
+
 void expectandnext(Token t) {
   if (CurTok != t)
     cupErrorf("'%t' expected, but got '%t'", t, CurTok);
   getNextToken(false);
 }
 
-const Node primary(uint8_t mpower) {
+const std::list<Node> primary(uint8_t mpower) {
   // TODO: unary T_ADD T_SUB T_NOT
-  Node left = {};
-	left.scope = this_scope;
+  std::list<Node> left = {};
+
   switch (CurTok) {
   case T_ORB: {
-    getNextToken(true);
-    left = primary();
+    if (getNextToken(true) != T_CRB) {
+      left = primary();
+    }
+    else {
+      left.push_back({ N_COMMA, 0 });
+    }
     expectandnext(T_CRB);
     break;
   }
   case T_IDENTIFIER: {
-    left.type = N_VARIABLE;
-    left.as.inumber = token_num;
+    Node var = { N_VARIABLE, token_num };
+
     getNextToken(false);
     if (CurTok == T_ORB) {
-      Node temp = { N_CALL, this_scope };
-      temp.nodes.push_back(left);
-      left = temp;
-			if (getNextToken(true) == T_CRB) {
-        left.nodes.push_back(empty);
-			}
-			else {
-        left.nodes.push_back(primary());
-			}
-      expectandnext(T_CRB);
+      Node call = { N_CALL };
+      left.push_back(call);
+      left.push_back(var);
+      auto right = primary();
+      left.insert(left.end(), right.begin(), right.end());
     }
     else if (CurTok == T_OSB) {
-      getNextToken(true);
-      Node node = { N_SUBSCRIPT };
-      node.nodes.push_back(left);
-      node.nodes.push_back(primary());
-      left = node;
-      expectandnext(T_CSB);
+      Node sub = { N_SUBSCRIPT };
+      left.push_back(sub);
+      left.push_back(var);
+      auto right = primary();
+      left.insert(left.end(), right.begin(), right.end());
+    }
+    else {
+      left.push_back(var);
     }
     break;
   }
   case T_STRING: {
-    left.type = N_STRING;
-    left.as.inumber = token_num;
+    Node n = { N_STRING, token_num };
+    left.push_back(n);
     getNextToken(false);
     break;
   }
   case T_NUMBER: {
-    left.type = N_NUMBER;
-    left.as.inumber = token_num;
-
-    if (getNextToken(false) != T_DOT)
-      break;
-
-    left.type = N_DOUBLE;
-    left.as.dnumber = (double)left.as.inumber;
-    if (getNextToken(false) != T_NUMBER)
-      break;
-
-    if (token_num != 0)
-      left.as.dnumber += (token_num / pow(10, floor(log10(token_num) + 1)));
+    Node n = { N_NUMBER, token_num };
+    if (getNextToken(false) == T_DOT) {
+      n.type = N_DOUBLE;
+      double* d = (double*)&n.info;
+      *d = (double)n.info;
+      if (getNextToken(false) == T_NUMBER) {
+        if (token_num != 0)
+          *d += (token_num / pow(10, floor(log10(token_num) + 1)));
+      }
+    }
+    left.push_back(n);
     break;
   }
   case T_OSB: {
-    left.type = N_ARRAY;
-    if (getNextToken(true) == T_CSB) {
-			cupError("empty array not implemented yet");
+    Node n = { N_ARRAY };
+    left.push_back(n);
+    getNextToken(true);
+    if (CurTok == T_CSB) {
       getNextToken(false);
-      left.ty = ArrayType::get(Type::getInt64Ty(*TheContext), 0);
-      break;
-    }
-    auto arr = primary();
-
-    expectandnext(T_CSB);
-
-    if (arr.type != N_COMMA) {
-      left.nodes.push_back(arr);
+      left.push_back({ N_COMMA, 0 });
     }
     else {
-      left.nodes = arr.nodes;
+      auto right = primary();
+      left.insert(left.end(), right.begin(), right.end());
+      expectandnext(T_CSB);
     }
-
     break;
   }
   case T_OCB: {
-    left.type = N_OBJECT;
-    if (getNextToken(true) == T_CCB) {
-      getNextToken(false);
-			cupError("empty object not implemented yet");
-    }
+    if (getNextToken(true) == T_CCB)
+      cupError("Empty object not implemented yet");
+    left.push_back({ N_OBJECT });
+    auto right = primary();
+    left.insert(left.end(), right.begin(), right.end());
+    if (CurTok == T_NL)
+      getNextToken(true);
 
-    while (CurTok != T_CCB) {
-      left.nodes.push_back(statement());
-    }
-    getNextToken(false); // skip T_CCB }
-    //left.ty = StructType::create(*TheContext, "object");
-		break;
+    expectandnext(T_CCB);
+    break;
   }
-  case T_THIS:
-    cupErrorf("not implemented yet '%t'\n", CurTok);
-		break;
   case T_VARG: {
     getNextToken(false);
-		left.type = N_VARG;
-		break;
+    left.push_back({ N_VARG });
+    break;
   }
   default:
     cupErrorf("Unexpected token '%t'\n", CurTok);
@@ -1710,70 +2186,46 @@ const Node primary(uint8_t mpower) {
   }
 
   while (true) {
-    Token t = CurTok;
-    auto power = getPower(t);
+    auto power = getPower(CurTok);
     if (power.first < mpower)
       return left;
-    getNextToken(false);
-    Node right = primary(power.second);
+    Token t = CurTok;
+    if (t != T_ORB && t != T_OSB)
+      getNextToken(t == T_COMMA);
+    else
+      cupError("T_ORB and T_OSB not implemented yet");
+    auto right = primary(power.second);
 
-    if (left.type == N_OPERATOR && left.as.token == T_COMMA && t == T_COMMA)
-    {
-      left.nodes.push_back(right);
+    if (left.front().type == N_COMMA && t == T_COMMA) {
+      left.insert(left.end(), right.begin(), right.end());
+      left.front().info++;
     }
     else {
-      Node node = { N_OPERATOR, this_scope };
-      node.as.token = t;
-
-      node.nodes.push_back(left); // copy
-      node.nodes.push_back(right);
-
-      left = node;
+      if (t == T_EQ) {
+        left.insert(left.end(), right.begin(), right.end());
+        left.push_front({ N_ASSIGN });
+      }
+      else if (t == T_ADD) {
+        left.insert(left.end(), right.begin(), right.end());
+        left.push_front({ N_ADD });
+      }
+      else if (t == T_COMMA) {
+        left.insert(left.end(), right.begin(), right.end());
+        left.push_front({ N_COMMA, 2 });
+      }
+      else if (t == T_EQEQ) {
+        left.insert(left.end(), right.begin(), right.end());
+        left.push_front({ N_EQEQ });
+      }
+      else {
+        cupErrorf("Unknown operator '%t'", t);
+      }
     }
   }
 }
 
-void argsparse(Node& nodes) {
-  while (true) {
-    if (CurTok == T_ORB) {
-      if (getNextToken(true) == T_CRB) {
-        getNextToken(true);
-        return;
-      }
-      argsparse(nodes);
-
-      if (CurTok != T_CRB)
-        cupErrorf("')' expected, but got '%t'", CurTok);
-
-      getNextToken(false);
-    }
-    else {
-      if (CurTok == T_OCB)
-        return;
-      if (CurTok != T_IDENTIFIER)
-        cupErrorf("lvalue expected, but got '%t'", CurTok);
-      Node out = { N_VARIABLE };
-      out.as.inumber = token_num;
-      if (getNextToken(false) == T_EQ) {
-        Node left = { N_VARIABLE };
-        left.as.inumber = out.as.inumber;
-        out.as.token = CurTok;
-        out.type = N_OPERATOR;
-        getNextToken(true);
-        out.nodes.push_back(left);
-        out.nodes.push_back(primary());
-      }
-      nodes.nodes.push_back(out);
-    }
-    if (CurTok != T_COMMA)
-      return;
-    getNextToken(true);
-  }
-}
-
-const Node statement() { // statement
-  Node node = {};
-  node.scope = this_scope;
+const std::list<Node> statement() { // statement
+  std::list<Node> left;
 
   switch (CurTok) {
   case T_IMPORT:
@@ -1782,7 +2234,7 @@ const Node statement() { // statement
     if (getNextToken(false) != T_STRING) {
       cupError("Expected DLL name after '~'");
     }
-		lld_args.push_back(global_strings[token_num]);
+    lld_args.push_back(global_strings[token_num]);
     //const char* dllName = token_string;
     //std::string errMsg;
     // Load the DLL permanently
@@ -1792,93 +2244,100 @@ const Node statement() { // statement
     getNextToken(false); // Move to next token
   } break;
   default: {
-    node = primary();
+    left = primary();
   } break;
   case T_RETURN: {
     getNextToken(true);
-    node.type = N_CONTROLFLOW;
-    node.as.token = T_RETURN;
-    node.nodes.push_back(primary());
+    left.push_back({ N_RETURN });
+    auto right = primary();
+    left.insert(left.end(), right.begin(), right.end());
   } break;
   case T_BREAK: {
     getNextToken(false);
-    node.type = N_CONTROLFLOW;
-    node.as.token = T_BREAK;
+    left.push_back({ N_BREAK });
   } break;
   case T_CONTINUE: {
     getNextToken(false);
-    node.type = N_CONTROLFLOW;
-    node.as.token = T_CONTINUE;
+    left.push_back({ N_CONTINUE });
   } break;
   case T_AT: { // function
-		getNextToken(false);
+    getNextToken(false);
     if (CurTok == T_AT) {
-			cupError("function prototype not implemented yet");
+      cupError("function prototype not implemented yet");
     }
     if (CurTok != T_IDENTIFIER)
       cupError("Expected function name in prototype");
-    node.type = N_FUNCTION;
+    left.push_back({ N_FUNCTION });
 
-    Node proto = { N_CALL, this_scope };
-
-    Node protocall = { N_VARIABLE, this_scope };
-    protocall.as.inumber = token_num;
+    Node protoname = { N_VARIABLE };
+    protoname.info = token_num;
+    left.push_back(protoname);
 
     expectandnext(T_IDENTIFIER);
-    proto.nodes.push_back(protocall);
-    
-		Scope* oldScope = this_scope;
-		this_scope = new Scope();
-		this_scope->parent = oldScope;
 
-    Node nodeargs = { N_COMMA, this_scope };
-    argsparse(nodeargs);
-    proto.nodes.push_back(nodeargs);
+    //Scope* oldScope = this_scope;
+    //this_scope = new Scope();
+    //this_scope->parent = oldScope;
 
-    node.nodes.push_back(proto);
+    auto args = primary();
+    left.insert(left.end(), args.begin(), args.end());
 
     if (CurTok == T_NL)
       getNextToken(true);
 
-    node.nodes.push_back(statement());
-    return node;
+    auto body = statement();
+    left.insert(left.end(), body.begin(), body.end());
+
+    //this_scope = oldScope;
+    return left;
   }
   case T_OCB: { // block
     getNextToken(true); // skip T_OCB {
-    Scope* oldScope = this_scope;
-    this_scope = new Scope();
-    this_scope->parent = oldScope;
 
-    node.type = N_BLOCK;
+    //Scope* oldScope = this_scope;
+    //this_scope = new Scope();
+    //this_scope->parent = oldScope;
+
+
+    left.push_back({ N_BLOCK });
     while (CurTok != T_CCB) {
-      node.nodes.push_back(statement());
+      auto right = statement();
+      if (right.empty())
+        continue;
+      left.insert(left.end(), right.begin(), right.end());
+      left.front().info++;
     }
 
-    this_scope = oldScope;
+    //this_scope = oldScope;
 
     getNextToken(true); // skip T_CCB }
 
-    return node;
+    return left;
   }
   case T_IF: {
     getNextToken(true);
 
-    node.type = N_IF;
-    node.nodes.push_back(primary());
-    node.nodes.push_back(statement());
+    left.push_back({ N_IF });
+    auto cond = primary();
+    left.insert(left.end(), cond.begin(), cond.end());
+    auto body = statement();
+    left.insert(left.end(), body.begin(), body.end());
     if (CurTok == T_ELSE) {
       getNextToken(true);
-      node.nodes.push_back(statement());
+      left.push_front({ N_IFELSE });
+      auto right = statement();
+      left.insert(left.end(), right.begin(), right.end());
     }
-    return node;
+    return left;
   }
-  case T_FOR: {
+  case T_WHILE: {
     getNextToken(true);
-
-    node.type = N_FOR;
-    node.nodes.push_back(primary());
-    node.nodes.push_back(statement());
-    return node;
+    left.push_back({ N_WHILE });
+    auto cond = primary();
+    left.insert(left.end(), cond.begin(), cond.end());
+    auto body = statement();
+    left.insert(left.end(), body.begin(), body.end());
+    return left;
   }
   }
 
@@ -1886,10 +2345,10 @@ const Node statement() { // statement
     getNextToken(true);
   else if (CurTok != T_EOF) {
     // TODO: say something like "find two or more expression statements in a row"
-    fputs("Expected newline111\n", stderr);
+    fputs("Expected newline\n", stderr);
   }
 
-  return node;
+  return left;
 }
 
 int main(int argc, const char** argv) {
@@ -1904,7 +2363,7 @@ int main(int argc, const char** argv) {
     bool x32;
     bool debug;
   } options = { 0 };
-  
+
   //"kernel32.lib",
       //"user32.lib",
       //"/libpath:C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.42.34433\\lib\\x64",
@@ -1938,9 +2397,9 @@ int main(int argc, const char** argv) {
       case 'l':
       case 'L':
         if (i + 1 < argc)
-					lld_args.push_back(argv[++i]);
-				else
-					cupError("Missing argument for -l option");
+          lld_args.push_back(argv[++i]);
+        else
+          cupError("Missing argument for -l option");
         continue;
       case 'H':
       case 'h':
@@ -1967,15 +2426,16 @@ int main(int argc, const char** argv) {
   llvm::InitializeNativeTargetAsmParser();
   TheJIT = ExitOnErr(CUPJIT::Create());
   InitializeModuleAndManagers();
-  root = { N_BLOCK };
   global_strings.push_back(rstr);
   global_strings.push_back(lstr);
   global_strings.push_back(sstr);
   global_strings.push_back(thisstr);
+
   this_scope = new Scope();
-  auto node = parse();
-  // auto result = codegen(node);
-  auto result = codegenModule(node);
+
+  parse();
+
+  auto result = codegenModule();
   if (!result) {
     cupError("codegen failed");
   }
@@ -2003,21 +2463,27 @@ int main(int argc, const char** argv) {
     std::error_code EC;
     raw_fd_ostream dest(obj_filename, EC, sys::fs::OF_None);
     if (EC) {
-			cupErrorf("Error opening file %s for writing object: %s\n", obj_filename.c_str(), EC.message().c_str());
+      cupErrorf("Error opening file %s for writing object: %s\n", obj_filename.c_str(), EC.message().c_str());
     }
 
     Expected<std::unique_ptr<MemoryBuffer>> ObjBufOrErr = TheJIT->getMemoryBufferForFile();
-		if (!ObjBufOrErr) {
-			cupErrorf("Error getting memory buffer for file: %s\n", toString(ObjBufOrErr.takeError()).c_str());
-		}
+    if (!ObjBufOrErr) {
+      cupErrorf("Error getting memory buffer for file: %s\n", toString(ObjBufOrErr.takeError()).c_str());
+    }
     std::unique_ptr<MemoryBuffer> ObjBuf = std::move(*ObjBufOrErr);
     dest.write(ObjBuf->getBufferStart(), ObjBuf->getBufferSize());
     dest.close();
-		printf("Object file emitted to %s\n", obj_filename.c_str());
-    
-		std::string exe_filename = "/out:" + std::string(file.name) + ".exe";
-		lld_args[3] = obj_filename.c_str();
-		lld_args[4] = exe_filename.c_str();
+    printf("Object file emitted to %s\n", obj_filename.c_str());
+
+    std::string exe_filename = "/out:" + std::string(file.name) + ".exe";
+    lld_args[3] = obj_filename.c_str();
+    lld_args[4] = exe_filename.c_str();
+#ifdef _WIN32
+    lld_args[0] = "lld-link";
+#else
+    lld_args[0] = "ld64.lld";
+#endif // 
+
     auto r = lld::lldMain(lld_args, llvm::outs(), llvm::errs(), LLD_ALL_DRIVERS);
     //printf("lld64 canRunAgain: %d\n", r.canRunAgain);
     if (r.retCode != 0) {
@@ -2028,7 +2494,7 @@ int main(int argc, const char** argv) {
 
   // Continue with JIT execution
   if (true) {
-    auto TSM = llvm::orc::ThreadSafeModule::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+    auto TSM = llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
     ExitOnErr(TheJIT->addModule(std::move(TSM)));
     auto ExprSymbol = ExitOnErr(TheJIT->lookup("main"));
     uint64_t(*mainF)() = ExprSymbol.getAddress().toPtr<uint64_t(*)()>();
